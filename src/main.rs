@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -177,8 +177,69 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
         "emoji".to_string(),
         plist::Value::String(acc.naming.emoji.clone()),
     );
+    let mut alignment = Dictionary::new();
+    if !acc.alignment_id.is_empty() {
+        alignment.insert(
+            "recordIdentifier".to_string(),
+            plist::Value::String(acc.alignment_id.clone()),
+        );
+    }
+    alignment.insert(
+        "beaconIdentifier".to_string(),
+        plist::Value::String(acc.alignment.beacon_identifier.clone()),
+    );
+    alignment.insert(
+        "lastIndexObserved".to_string(),
+        plist::Value::Integer(acc.alignment.last_index_observed.into()),
+    );
+    if let Some(last_observed) = acc.alignment.last_index_observation_date {
+        alignment.insert(
+            "lastIndexObservationDate".to_string(),
+            plist::Value::Date(last_observed.into()),
+        );
+    }
+    dict.insert(
+        "alignment".to_string(),
+        plist::Value::Dictionary(alignment),
+    );
 
     plist::Value::Dictionary(dict)
+}
+
+fn safe_filename_component(value: &str) -> String {
+    let safe: String = value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+
+    if safe.is_empty() {
+        "Unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn accessory_filename(acc: &BeaconAccessory, used_names: &mut HashSet<String>) -> String {
+    let safe_name = safe_filename_component(&acc.naming.name);
+    let stable_id = safe_filename_component(&acc.master_record.stable_identifier);
+    let suffix: String = stable_id.chars().take(12).collect();
+    let suffix = if suffix.is_empty() {
+        "unknown".to_string()
+    } else {
+        suffix
+    };
+
+    let base = format!("{}__{}", safe_name, suffix);
+    let mut filename = format!("{}.plist", base);
+    let mut counter = 2;
+
+    while used_names.contains(&filename) {
+        filename = format!("{}__{}.plist", base, counter);
+        counter += 1;
+    }
+
+    used_names.insert(filename.clone());
+    filename
 }
 
 // ── Password reading ────────────────────────────────────────────────────
@@ -221,9 +282,24 @@ fn disable_echo_read() -> String {
 
 // ── Main ────────────────────────────────────────────────────────────────
 
+fn init_logging() {
+    let mut builder = pretty_env_logger::formatted_timed_builder();
+    let filters = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+
+    builder.parse_filters(&filters);
+    builder.init();
+}
+
+fn confirm_cleanup() -> Result<bool, Box<dyn std::error::Error>> {
+    eprint!("  Type DELETE to remove these fake escrow bottles: ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim() == "DELETE")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    pretty_env_logger::init();
+    init_logging();
 
     init_keystore(SoftwareKeystore {
         state: plist::from_file("keystore.plist").unwrap_or_default(),
@@ -238,6 +314,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut apple_id = String::new();
     let mut anisette_url = "https://ani.sidestore.io".to_string();
     let mut output_dir = PathBuf::from(".");
+    let mut cleanup_fake_bottles = false;
+    let mut assume_yes = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -254,6 +332,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 output_dir = PathBuf::from(&args[i]);
             }
+            "--cleanup-fake-bottles" => {
+                cleanup_fake_bottles = true;
+            }
+            "--yes" | "-y" => {
+                assume_yes = true;
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: export_findmy [OPTIONS]");
                 eprintln!();
@@ -261,6 +345,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  --apple-id <email>       Apple ID email");
                 eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
+                eprintln!("  --cleanup-fake-bottles   Delete escrow bottles created by this tool's fake device");
+                eprintln!("  --yes, -y                Do not prompt before cleanup deletion");
                 eprintln!();
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());
@@ -377,6 +463,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client: cloudkit.clone(),
     });
 
+    if cleanup_fake_bottles {
+        eprintln!("[5/5] Looking for fake escrow bottles...");
+        let bottles = keychain.get_viable_bottles().await?;
+        let fake_bottles: Vec<_> = bottles
+            .iter()
+            .filter(|(_, meta)| meta.serial == "F2LZN0FAKE00")
+            .collect();
+
+        if fake_bottles.is_empty() {
+            eprintln!("  No fake escrow bottles found.");
+            return Ok(());
+        }
+
+        eprintln!("  Found {} fake escrow bottle(s):", fake_bottles.len());
+        for (i, (bottle, meta)) in fake_bottles.iter().enumerate() {
+            eprintln!(
+                "    [{}] label={} serial={} bottle_id={} timestamp={}",
+                i,
+                bottle.id(),
+                meta.serial,
+                meta.bottle_id,
+                meta.timestamp
+            );
+        }
+
+        if !assume_yes && !confirm_cleanup()? {
+            eprintln!("  Cleanup cancelled.");
+            return Ok(());
+        }
+
+        for (bottle, meta) in fake_bottles {
+            eprintln!("  Deleting {} ({})...", bottle.id(), meta.bottle_id);
+            keychain.delete(bottle.id()).await?;
+        }
+
+        eprintln!("  Deleted fake escrow bottles.");
+        return Ok(());
+    }
+
     // ── Step 5: Join iCloud Keychain circle via escrow ────────────
     eprintln!("[5/7] Joining iCloud Keychain trust circle...");
     let bottles = keychain.get_viable_bottles().await?;
@@ -415,10 +540,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let container = SEARCH_PARTY_CONTAINER
         .init(cloudkit.clone())
         .await?;
+    eprintln!("1");
     let beacon_zone = container.private_zone("BeaconStore".to_string());
+    eprintln!("2");
     let key = container
         .get_zone_encryption_config(&beacon_zone, &keychain, &FIND_MY_SERVICE)
         .await?;
+    eprintln!("3");
 
     let mut beacon_records: HashMap<String, MasterBeaconRecord> = HashMap::new();
     let mut naming_records: HashMap<String, (String, BeaconNamingRecord)> = HashMap::new();
@@ -430,6 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &NO_ASSETS,
     )
     .await;
+    eprintln!("4");
     if should_reset(result.as_ref().err()) {
         result = FetchRecordChangesOperation::do_sync(
             &container,
@@ -437,7 +566,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &NO_ASSETS,
         )
         .await;
+    eprintln!("5");
     }
+
+    eprintln!("6");
 
     let (_, changes, _) = result?.remove(0);
 
@@ -476,7 +608,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (identifier, item),
             );
         }
+
+
+    eprintln!("8");
     }
+
+    eprintln!("Assembling accessories");
 
     // ── Assemble accessories ────────────────────────────────────────
     let mut accessories: HashMap<String, BeaconAccessory> = HashMap::new();
@@ -526,14 +663,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let mut used_filenames = HashSet::new();
     for acc in accessories.values() {
-        let safe_name: String = acc
-            .naming
-            .name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        let filename = format!("{}.plist", safe_name);
+        let filename = accessory_filename(acc, &mut used_filenames);
         let path = output_dir.join(&filename);
 
         let plist_val = accessory_to_plist(acc);
