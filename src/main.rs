@@ -126,54 +126,77 @@ impl OSConfig for FakeIOSConfig {
     }
 }
 
-// ── Plist generation ────────────────────────────────────────────────────
+trait Valuable {
+    fn to_value(self) -> plist::Value;
+}
 
-fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
+impl Valuable for plist::Value {
+    fn to_value(self) -> plist::Value {
+        self
+    }
+}
+
+impl Valuable for plist::Dictionary {
+    fn to_value(self) -> plist::Value {
+        plist::Value::Dictionary(self)
+    }
+}
+
+// ── Plist generation ────────────────────────────────────────────────────
+fn dict<V>(key: &str, value: V) -> plist::Value where V: Valuable  {
     let mut dict = Dictionary::new();
 
-    dict.insert(
+    dict.insert(key.to_string(), value.to_value());
+
+    plist::Value::Dictionary(dict)
+}
+
+fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
+    let mut accessory = Dictionary::new();
+
+    accessory.insert(
         "privateKey".to_string(),
-        plist::Value::Data(acc.master_record.private_key.clone()),
+        dict("key", dict("data", plist::Value::Data(acc.master_record.private_key.clone()))),
     );
-    dict.insert(
+    accessory.insert(
         "sharedSecret".to_string(),
-        plist::Value::Data(acc.master_record.shared_secret.clone()),
+        dict("key", dict("data", plist::Value::Data(acc.master_record.shared_secret.clone()))),
     );
     if let Some(ref ss2) = acc.master_record.shared_secret_2 {
-        dict.insert(
+        accessory.insert(
             "secondarySharedSecret".to_string(),
-            plist::Value::Data(ss2.clone()),
+            dict("key", dict("data", plist::Value::Data(ss2.clone()))),
         );
     }
     if let Some(ref slss) = acc.master_record.secure_locations_shared_secret {
-        dict.insert(
+        accessory.insert(
             "secureLocationsSharedSecret".to_string(),
             plist::Value::Data(slss.clone()),
         );
     }
-    dict.insert(
+    accessory.insert(
         "publicKey".to_string(),
-        plist::Value::Data(acc.master_record.public_key.clone()),
+        dict("key", dict("data", plist::Value::Data(acc.master_record.public_key.clone()))),
     );
-    dict.insert(
+    accessory.insert(
         "identifier".to_string(),
         plist::Value::String(acc.master_record.stable_identifier.clone()),
     );
-    dict.insert(
+    accessory.insert(
         "model".to_string(),
         plist::Value::String(acc.master_record.model.clone()),
     );
     if let Some(pairing_date) = acc.master_record.pairing_date {
-        dict.insert(
+        accessory.insert(
             "pairingDate".to_string(),
             plist::Value::Date(pairing_date.into()),
         );
     }
-    dict.insert(
+    accessory.insert(
         "name".to_string(),
         plist::Value::String(acc.naming.name.clone()),
     );
-    dict.insert(
+    accessory.insert(
         "emoji".to_string(),
         plist::Value::String(acc.naming.emoji.clone()),
     );
@@ -198,12 +221,12 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
             plist::Value::Date(last_observed.into()),
         );
     }
-    dict.insert(
+    accessory.insert(
         "alignment".to_string(),
         plist::Value::Dictionary(alignment),
     );
 
-    plist::Value::Dictionary(dict)
+    plist::Value::Dictionary(accessory)
 }
 
 fn safe_filename_component(value: &str) -> String {
